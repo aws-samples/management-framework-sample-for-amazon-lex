@@ -1,0 +1,311 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Parameters:
+  Environment:
+    Type: String
+  BotName:
+    Type: String
+Resources:
+  LexBotRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: "This is a reference implementation. This IAM role requires wildcard permissions for a specific use case."
+          - id: W28
+            reason: "This is a reference implementation. This role name is required for integration with an existing system."
+    Properties:
+      Description: "Role for Lex Bot"
+      Path: "/"
+      RoleName: !Sub "${AWS::StackName}-Role"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lexv2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: LexBotV2Policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - polly:SynthesizeSpeech
+                Resource: '*'
+
+  LexBotLogsKey:
+    Type: AWS::KMS::Key
+    DependsOn:
+       - LexBotRole
+    Properties:
+      Description: KMS Key for Lex Bot logs
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: lex-bot-logs-key-id
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow administrators
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:role/lex_mgmt_role'
+            Action:
+              - 'kms:Create*'
+              - 'kms:Describe*'
+              - 'kms:Enable*'
+              - 'kms:List*'
+              - 'kms:Put*'
+              - 'kms:Update*'
+              - 'kms:Revoke*'
+              - 'kms:Disable*'
+              - 'kms:Get*'
+              - 'kms:Delete*'
+              - 'kms:TagResource'
+              - 'kms:UntagResource'
+              - 'kms:ScheduleKeyDeletion'
+              - 'kms:CancelKeyDeletion'
+              - 'kms:RotateKeyOnDemand'
+            Resource: '*'
+          - Sid: Allow use of the key
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:DescribeKey'
+              - 'kms:Encrypt'
+              - 'kms:ReEncryptFrom'
+              - 'kms:ReEncryptTo'
+              - 'kms:GenerateDataKey'
+              - 'kms:GenerateDataKeyPair'
+              - 'kms:GenerateDataKeyPairWithoutPlaintext'
+              - 'kms:GenerateDataKeyWithoutPlaintext'
+            Resource: '*'
+            Condition:
+              ArnEquals:
+                kms:EncryptionContext:aws:logs:arn: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lex/${AWS::StackName}-log"
+
+  LexBotLogsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${AWS::StackName}-logs-key"
+      TargetKeyId: !Ref LexBotLogsKey
+
+  LexBotLogsKeyPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: LexBotLogsKeyPolicy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - "kms:Encrypt"
+              - "kms:Decrypt"
+            Resource:
+              - !GetAtt LexBotLogsKey.Arn
+      Roles:
+        - !Sub "${AWS::StackName}-Role"
+    DependsOn:
+      - LexBotRole
+
+  LexBotLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      KmsKeyId: !GetAtt LexBotLogsKey.Arn
+      LogGroupName: !Sub "/aws/lex/${AWS::StackName}-log"
+      RetentionInDays: 7
+
+  LexBotLogsPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: LexBotLogsPolicy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource:
+              - !GetAtt LexBotLogGroup.Arn
+      Roles:
+        - !Sub "${AWS::StackName}-Role"
+    DependsOn:
+      - LexBotRole
+
+  LexBot:
+    Type: AWS::Lex::Bot
+    Properties:
+      RoleArn: !GetAtt LexBotRole.Arn
+      Description: Lex Bot
+      BotLocales:
+        - Description: "Lex Bot Locale"
+          LocaleId: "en_GB"
+          NluConfidenceThreshold: 0.4
+          Intents:
+            - Name: "InitIntent"
+              Description: "Temporary intent for bot initialisation"
+              SampleUtterances:
+                - Utterance: "Initial"
+            - Name: "FallbackIntent"
+              Description: "Default fallback intent"
+              ParentIntentSignature: "AMAZON.FallbackIntent"
+              DialogCodeHook:
+                Enabled: false
+              FulfillmentCodeHook:
+                Enabled: true
+          VoiceSettings:
+            VoiceId: Amy
+            Engine: neural
+      DataPrivacy:
+        ChildDirected: false
+      IdleSessionTTLInSeconds: 300
+      Name: !Sub "${Environment}-${BotName}"
+      AutoBuildBotLocales: true
+
+  LexBotVersion:
+    Type: AWS::Lex::BotVersion
+    Properties:
+      BotId: !GetAtt LexBot.Id
+      BotVersionLocaleSpecification:
+      - LocaleId: en_GB
+        BotVersionLocaleDetails:
+          SourceBotVersion: DRAFT
+
+  LexBotResourcePolicy:
+    Type: AWS::Lex::ResourcePolicy
+    Properties:
+      ResourceArn: !Join ["", [!Sub "arn:aws:lex:${AWS::Region}:${AWS::AccountId}:bot-alias/",!GetAtt LexBot.Id,"/",!GetAtt LexBotAlias.BotAliasId]]
+      Policy:
+        Version: 2012-10-17
+        Statement:
+          - Sid: connect-bot
+            Effect: Allow
+            Principal:
+              Service:
+                - "connect.amazonaws.com"
+            Action:
+              - "lex:RecognizeText"
+              - "lex:StartConversation"
+            Resource: !Join ["", [!Sub "arn:aws:lex:${AWS::Region}:${AWS::AccountId}:bot-alias/",!GetAtt LexBot.Id,"/",!GetAtt LexBotAlias.BotAliasId]]
+            Condition:
+              StringEquals:
+                AWS:SourceAccount: !Ref AWS::AccountId
+              ArnEquals:
+                AWS:SourceArn: !Sub "arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/*"
+
+  LexBotAlias:
+    Type: AWS::Lex::BotAlias
+    Properties:
+      BotId: !Ref LexBot
+      BotAliasName: !Sub "${Environment}-${BotName}-alias"
+      BotVersion: !GetAtt LexBotVersion.BotVersion
+      BotAliasLocaleSettings:
+        - LocaleId: en_GB
+          BotAliasLocaleSetting:
+            Enabled: true
+            CodeHookSpecification:
+              LambdaCodeHook:
+                CodeHookInterfaceVersion: 1.0
+                LambdaArn: !GetAtt DialogueLambda.Arn
+      SentimentAnalysisSettings:
+        DetectSentiment: false
+      ConversationLogSettings:
+        TextLogSettings:
+          - Destination:
+              CloudWatch:
+                CloudWatchLogGroupArn: !GetAtt LexBotLogGroup.Arn
+                LogPrefix: !Sub "${Environment}-${BotName}"
+            Enabled: true
+
+  LexBotAliasInvokePermissions:
+    Type: AWS::Lambda::Permission
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W24
+            reason: "This Lambda permission is required for a specific use case."
+    Properties:
+      FunctionName: !Ref DialogueLambda
+      Action: lambda:invokeFunction
+      Principal: lexv2.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !Sub "arn:aws:lex:${AWS::Region}:${AWS::AccountId}:bot-alias/*/*"
+  
+  DialogueLambdaRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "This is a reference implementation. This role name is required for integration with an existing system."
+    Properties:
+      Description: Role used for the DialogueLambda function
+      RoleName: !Sub "DialogueLambda-${BotName}-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/DialogueLambda*:*"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-stream:/aws/lambda/DialogueLambda-*:log-stream:*"
+
+  DialogueLambda:
+    #checkov:skip=CKV_AWS_115:We don't know our concurrent limits yet
+    #checkov:skip=CKV_AWS_116:functions not asynchronous (called via Lex) so DLQ not needed
+    #checkov:skip=CKV_AWS_117:This is a reference implementation. Actual implementation should be deployed inside a VPC
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "This is a reference implementation. Actual implementation should be deployed inside a VPC"
+          - id: W28
+            reason: "This is a reference implementation. This function name is required for integration with an existing system."
+          - id: W92
+            reason: "This is a reference implementation. We don't know our concurrent limits yet"
+    Properties:
+      Description: Lambda function for dialogue
+      Timeout: 60
+      CodeUri: dialogue_lambda/
+      Handler: main.lambda_handler
+      Runtime: python3.10
+      MemorySize: 128
+      Tracing: Active
+      Role: !GetAtt DialogueLambdaRole.Arn
+      Events:
+        ScheduleWarmupEvent:
+          Type: Schedule
+          Properties:
+            Description: Warm up Lambda
+            Input: "{ \"warmup\": \"true\" }"
+            Schedule: rate(5 minutes)
+            Enabled: true
